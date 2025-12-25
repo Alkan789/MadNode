@@ -1,59 +1,89 @@
 #!/bin/bash
 
-# --- 1. GİZLİLİK VE SSH AYARI ---
+# --- 1. SİSTEM AYARLARI ---
 export NODE_NAME="sys-update-daemon"
-sudo useradd -m -s /bin/bash miysoft
-echo "miysoft:$SSH_PASSWORD" | sudo chpasswd
-sudo usermod -aG sudo miysoft
 
-# --- 2. CLOUDFLARE SSH TÜNELİ (Dışarıdan Bağlantı İçin) ---
-wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O cloudflared
-chmod +x cloudflared
-# Arka planda SSH portunu (22) dışarı açar ve linki miysoft paneline gönderir
-./cloudflared tunnel --url tcp://localhost:22 > cf.log 2>&1 &
-sleep 5
-SSH_URL=$(grep -oE "https://[a-zA-Z0-9.-]+\.trycloudflare\.com" cf.log | head -n 1)
-
-# --- 3. GOOGLE DRIVE VE YEDEK KONTROLÜ ---
+# --- 2. GOOGLE DRIVE AYARLARI ---
 mkdir -p ~/.config/rclone
 echo "[gdrive]
 type = drive
 token = $RCLONE_TOKEN_BODY" > ~/.config/rclone/rclone.conf
 
-if rclone ls gdrive:avail_backup/identity.json; then
-    rclone copy gdrive:avail_backup/ . --progress
-    echo "Cüzdan ve Kimlik yedeği geri yüklendi."
-else
-    echo "İlk kurulum: Cüzdan hazırlanıyor..."
-    # Eğer MNEMONIC varsa kullan, yoksa yeni üret
-    echo "$AVAIL_MNEMONIC" > mnemonic.txt
+# Klasör yoksa oluştur, varsa geç
+rclone mkdir gdrive:hemi_backup || true
+
+# Önceki cüzdanı çek
+rclone copy gdrive:hemi_backup/popm_address.json . || echo "Yedek yok."
+
+# --- 3. HEMI BINARY KURULUM ---
+if [ ! -f "./popmd" ]; then
+    wget -q https://github.com/hemilabs/heminetwork/releases/download/v0.4.3/heminetwork_v0.4.3_linux_amd64.tar.gz
+    tar -xf heminetwork_v0.4.3_linux_amd64.tar.gz
+    cp heminetwork_v0.4.3_linux_amd64/popmd .
+    chmod +x popmd
 fi
 
-# --- 4. AVAIL LIGHT CLIENT KURULUMU ---
-# Işık hızıyla indir ve kur
-wget -q https://github.com/availproject/avail-light/releases/download/v1.7.10/avail-light-linux-amd64.tar.gz
-tar -xf avail-light-linux-amd64.tar.gz
-mv avail-light-linux-amd64 $NODE_NAME
+# --- 4. CÜZDAN OLUŞTURMA VE ADRES TESPİTİ ---
+if [ ! -f "./popm_address.json" ]; then
+    # Manuel Private Key Üretimi
+    PRIV_HEX=$(openssl rand -hex 32)
+    echo "{\"private_key\":\"$PRIV_HEX\",\"pubkey_hash\":\"generating...\"}" > popm_address.json
+    
+    # Hemen yedekle (Bayraksız, düz copy)
+    rclone copy popm_address.json gdrive:hemi_backup/
+fi
 
-# --- 5. İZLEME DÖNGÜSÜ ---
-./$NODE_NAME --network mainnet --identity ./identity.json $([ ! -z "$AVAIL_MNEMONIC" ] && echo "--seed $AVAIL_MNEMONIC") &
+# Ortam Değişkenlerini Ayarla
+export POPM_BTC_PRIVKEY=$(cat popm_address.json | jq -r '.private_key')
+export POPM_STATIC_FEE=50
+export POPM_BFG_URL="wss://testnet.rpc.hemi.network/v1/ws/public"
+
+# --- 5. MADENCİ BAŞLAT (LOGLARI KAYDET) ---
+# Logları miner.log dosyasına yazdırıyoruz
+./popmd > miner.log 2>&1 &
+
+# Adresin loglara düşmesi için 15 saniye bekle
+sleep 15
+
+# Loglardan adresi cımbızla çek (m harfiyle başlayan uzun dizi)
+DETECTED_ADDR=$(grep -oE "m[a-zA-Z0-9]{30,}" miner.log | head -n 1)
+
+# Eğer adres bulunduysa JSON dosyasını güncelle ve panele yansıt
+if [ ! -z "$DETECTED_ADDR" ]; then
+    echo "Adres Tespit Edildi: $DETECTED_ADDR"
+    # JSON'ı güncelle
+    jq --arg addr "$DETECTED_ADDR" '.pubkey_hash = $addr' popm_address.json > tmp.json && mv tmp.json popm_address.json
+    # Güncel hali yedekle
+    rclone copy popm_address.json gdrive:hemi_backup/
+else
+    # Bulunamazsa yedekteki adresi kullan (veya generating yazsın)
+    DETECTED_ADDR=$(cat popm_address.json | jq -r '.pubkey_hash')
+fi
+
+# --- 6. İZLEME DÖNGÜSÜ ---
 START_TIME=$SECONDS
-
-while [ $((SECONDS - START_TIME)) -lt 20400 ]; do
-    CPU=$(top -bn1 | grep "Cpu(s)" | awk '{print $2}')
+while [ $((SECONDS - START_TIME)) -lt 19800 ]; do 
+    CPU=$(grep 'cpu ' /proc/stat | awk '{usage=($2+$4)*100/($2+$4+$5)} END {print usage}')
     RAM=$(free | grep Mem | awk '{print $3/$2 * 100.0}')
     
-    # Miysoft paneline SSH linkini ve durumu gönder
-    curl -X POST -H "X-Miysoft-Key: $MIYSOFT_KEY" \
-         -d "{\"worker_id\":\"Worker_$WORKER_ID\", \"cpu\":\"$CPU\", \"ram\":\"$RAM\", \"ssh\":\"$SSH_URL\", \"status\":\"RUNNING\"}" \
-         https://miysoft.com/api.php
+    # Son 15 satır logu oku ve şifrele (URL bozulmasın diye base64 yapıyoruz)
+    LOGS=$(tail -n 15 miner.log | base64 -w 0)
+    
+    # Miysoft'a gönder
+    curl -s -X POST -H "X-Miysoft-Key: $MIYSOFT_KEY" \
+         -d "{\"worker_id\":\"W_$WORKER_ID\", \"cpu\":\"$CPU\", \"ram\":\"$RAM\", \"address\":\"$DETECTED_ADDR\", \"status\":\"HEMI_MINING\", \"logs\":\"$LOGS\"}" \
+         https://miysoft.com/api.php || true
     
     sleep 30
 done
 
-# --- 6. YEDEKLEME VE DEVİR ---
-pkill $NODE_NAME
-rclone copy identity.json gdrive:avail_backup/ --overwrite
-# Diğer repoyu tetikle
+# --- 7. KAPANIŞ ---
+pkill popmd
+# Son kez yedekle (Bayraksız)
+rclone copy popm_address.json gdrive:hemi_backup/
+
 TARGET_REPO=$([ "$GITHUB_REPOSITORY" == "Alkan789/MaxNode" ] && echo "Alkan789/MadNode" || echo "Alkan789/MaxNode")
-curl -X POST -H "Authorization: token $PAT_TOKEN" -d "{\"event_type\": \"next_worker\", \"client_payload\": {\"worker_id\": \"$((WORKER_ID + 1))\"}}" https://api.github.com/repos/$TARGET_REPO/dispatches
+curl -X POST -H "Authorization: token $PAT_TOKEN" \
+     -H "Accept: application/vnd.github.v3+json" \
+     https://api.github.com/repos/$TARGET_REPO/dispatches \
+     -d "{\"event_type\": \"next_worker\", \"client_payload\": {\"worker_id\": \"$((WORKER_ID + 1))\"}}"
